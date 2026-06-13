@@ -1,101 +1,106 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { drizzle } from 'drizzle-orm/d1'
-import { eq, sql } from 'drizzle-orm'
-import { users, referrals } from './schema'
+import { eq, desc, and } from 'drizzle-orm'
+import { users, referrals, userTasks } from './schema'
 import { verifyTelegramAuth } from './auth'
 
-type Bindings = {
-  DB: D1Database
-  TELEGRAM_BOT_TOKEN: string
-}
-
+type Bindings = { DB: D1Database; TELEGRAM_BOT_TOKEN: string }
 const app = new Hono<{ Bindings: Bindings }>()
-
 app.use('/api/*', cors())
 
 app.post('/api/auth/login', async (c) => {
   const { initData } = await c.req.json()
-  
-  const isValid = await verifyTelegramAuth(initData, c.env.TELEGRAM_BOT_TOKEN)
-  if (!isValid) {
-    return c.json({ error: 'Unauthorized payload' }, 401)
+  if (!(await verifyTelegramAuth(initData, c.env.TELEGRAM_BOT_TOKEN))) {
+    return c.json({ error: 'Unauthorized' }, 401)
   }
 
   const urlParams = new URLSearchParams(initData)
-  const userStr = urlParams.get('user')
-  // Extract structural start_param (Referral Payload) from Telegram URL[cite: 2]
+  const tgUser = JSON.parse(urlParams.get('user') || '{}')
   const startParam = urlParams.get('start_param') || '' 
-  
-  if (!userStr) {
-    return c.json({ error: 'No user data found' }, 400)
-  }
-
-  const tgUser = JSON.parse(userStr)
   const db = drizzle(c.env.DB)
+  const now = Date.now()
+  const ONE_DAY = 24 * 60 * 60 * 1000
 
-  // Check if user is already existing
   let user = await db.select().from(users).where(eq(users.telegramId, tgUser.id.toString())).get()
 
   if (!user) {
-    let referrerId: string | null = null
-    
-    // Parse referral code if present (Format expected: ref_123456)
-    if (startParam.startsWith('ref_')) {
-      const potentialReferrer = startParam.replace('ref_', '')
-      if (potentialReferrer !== tgUser.id.toString()) {
-        referrerId = potentialReferrer
-      }
-    }
+    // New User Logic + Referral (From previous step)
+    let referrerId = startParam.startsWith('ref_') ? startParam.replace('ref_', '') : null
+    if (referrerId === tgUser.id.toString()) referrerId = null
 
-    // Insert new user with referral tracking links
     await db.insert(users).values({
       telegramId: tgUser.id.toString(),
       firstName: tgUser.first_name,
-      username: tgUser.username || null,
+      username: tgUser.username,
       referredBy: referrerId,
-      points: referrerId ? 100 : 0 // Welcome bonus for joining via link
+      points: referrerId ? 100 : 0,
+      lastLoginAt: now,
+      loginStreak: 1
     }).execute()
 
-    // If referred by another valid active user, handle viral mechanics loop
     if (referrerId) {
       try {
-        await db.insert(referrals).values({
-          referrerId: referrerId,
-          referredId: tgUser.id.toString(),
-          pointsAwarded: 250 // Referrer incentive reward
-        }).execute()
+        await db.insert(referrals).values({ referrerId, referredId: tgUser.id.toString() }).execute()
+        await db.run(sql`UPDATE users SET points = points + 250 WHERE telegram_id = ${referrerId}`)
+      } catch (e) {}
+    }
+  } else {
+    // Daily Check-in Logic
+    let newStreak = user.loginStreak || 0
+    let pointsToAdd = 0
+    const timeSinceLastLogin = now - (user.lastLoginAt || 0)
 
-        // Atomically increment referrer's score balance
-        await db.update(users)
-          .set({ points: sql`${users.points} + 250` })
-          .where(eq(users.telegramId, referrerId))
-          .execute()
-      } catch (e) {
-        // Soft fail on referral collision constraints to protect auth loop pipeline
-      }
+    if (timeSinceLastLogin > ONE_DAY && timeSinceLastLogin < ONE_DAY * 2) {
+      newStreak += 1
+      pointsToAdd = Math.min(newStreak * 10, 100) // Cap daily bonus at 100
+    } else if (timeSinceLastLogin >= ONE_DAY * 2) {
+      newStreak = 1 // Reset streak
+      pointsToAdd = 10
     }
 
-    user = await db.select().from(users).where(eq(users.telegramId, tgUser.id.toString())).get()
+    if (pointsToAdd > 0) {
+      await db.update(users).set({
+        loginStreak: newStreak,
+        lastLoginAt: now,
+        points: (user.points || 0) + pointsToAdd
+      }).where(eq(users.telegramId, tgUser.id.toString())).execute()
+    }
   }
 
+  user = await db.select().from(users).where(eq(users.telegramId, tgUser.id.toString())).get()
   return c.json({ success: true, user })
 })
 
-app.get('/api/referrals/stats/:telegramId', async (c) => {
-  const telegramId = c.req.param('telegramId')
+// Leaderboard API (Lean MVP)
+app.get('/api/leaderboard', async (c) => {
+  const db = drizzle(c.env.DB)
+  const leaders = await db.select({
+    firstName: users.firstName,
+    points: users.points
+  }).from(users).orderBy(desc(users.points)).limit(50).execute()
+  
+  return c.json({ leaders })
+})
+
+// Complete a Task API
+app.post('/api/tasks/complete', async (c) => {
+  const { initData, taskId } = await c.req.json()
+  if (!(await verifyTelegramAuth(initData, c.env.TELEGRAM_BOT_TOKEN))) return c.json({ error: 'Unauthorized' }, 401)
+
+  const tgUser = JSON.parse(new URLSearchParams(initData).get('user') || '{}')
   const db = drizzle(c.env.DB)
 
-  const activeReferrals = await db
-    .select()
-    .from(referrals)
-    .where(eq(referrals.referrerId, telegramId))
-    .execute()
-
-  return c.json({
-    count: activeReferrals.length,
-    earnings: activeReferrals.reduce((acc, row) => acc + (row.pointsAwarded || 0), 0)
-  })
+  // Lean MVP: No actual API verification for joining groups. Just assume trust + manual checking later.
+  const taskReward = 50 // Fixed 50 points per task for MVP
+  
+  try {
+    await db.insert(userTasks).values({ telegramId: tgUser.id.toString(), taskId }).execute()
+    await db.run(sql`UPDATE users SET points = points + ${taskReward} WHERE telegram_id = ${tgUser.id.toString()}`)
+    return c.json({ success: true, reward: taskReward })
+  } catch (e) {
+    return c.json({ error: 'Task already completed' }, 400)
+  }
 })
 
 export default app
